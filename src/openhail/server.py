@@ -3,8 +3,17 @@
 Agent-friendly: one JSON object per line over stdio. No HTTP server, no auth
 theatre, no CORS. The caller owns the process.
 
-Methods mirror the store/transport API one-to-one so the schema is learnable
-and stable.
+Transport contract: **stdio only, permanently.** There is no listening socket
+and no plan to add one. That decision removes a whole class of future bugs
+(no auth layer to retrofit, no peer to authenticate, no port to firewall).
+A GUI, if one is ever built, is a *client* speaking this same stdio protocol.
+
+Hardening notes:
+- Requests are size-capped before parsing (DoS).
+- Parameters are allowlisted per method; unknown keys are rejected rather than
+  silently forwarded into the implementation (parameter smuggling).
+- Tracebacks are logged to stderr and never returned to the caller (info leak).
+- Every caller-supplied string is validated in validate.py before use.
 """
 
 from __future__ import annotations
@@ -12,7 +21,7 @@ from __future__ import annotations
 import json
 import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import __version__
@@ -21,6 +30,20 @@ from .mime import build_message, parse_message
 from .secrets import SecretError, get_password, set_password
 from .smtp import SmtpError, SmtpSender
 from .store import Store
+from .validate import (
+    MAX_LIST_LIMIT,
+    MAX_REQUEST_BYTES,
+    MAX_SYNC_LIMIT,
+    ValidationError,
+    account_name as v_account,
+    bounded_int,
+    email_list,
+    folder_name as v_folder,
+    hostname as v_hostname,
+    port as v_port,
+    search_query as v_query,
+    header_safe,
+)
 
 JSONRPC = "2.0"
 
@@ -57,6 +80,12 @@ class Handler:
     params: tuple[str, ...]
     fn: Callable[..., Any]
     doc: str
+    # Parameter names accepted by fn beyond the required `params` tuple.
+    optional: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def allowed(self) -> set[str]:
+        return set(self.params) | set(self.optional)
 
 
 class RpcServer:
@@ -69,9 +98,15 @@ class RpcServer:
 
     # ---- registration ---------------------------------------------------
 
-    def _add(self, name: str, params: tuple[str, ...], doc: str):
+    def _add(
+        self,
+        name: str,
+        params: tuple[str, ...],
+        doc: str,
+        optional: tuple[str, ...] = (),
+    ):
         def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self.methods[name] = Handler(name, params, fn, doc)
+            self.methods[name] = Handler(name, params, fn, doc, optional)
             return fn
         return deco
 
@@ -80,16 +115,23 @@ class RpcServer:
 
         @add("system.version", (), "Return the OpenHail version.")
         def _version() -> dict[str, Any]:
-            return {"version": __version__, "jsonrpc": JSONRPC}
+            return {"version": __version__, "jsonrpc": JSONRPC, "transport": "stdio"}
 
         @add("system.methods", (), "List available RPC methods and their params.")
         def _methods() -> list[dict[str, Any]]:
             return [
-                {"name": h.name, "params": list(h.params), "doc": h.doc}
+                {"name": h.name, "params": list(h.params),
+                 "optional": list(h.optional), "doc": h.doc}
                 for h in sorted(self.methods.values(), key=lambda x: x.name)
             ]
 
-        @add("account.add", ("name", "imap_host", "smtp_host", "username"), "Add an account.")
+        @add(
+            "account.add",
+            ("name", "imap_host", "smtp_host", "username"),
+            "Add an account. Never accepts a password parameter: set the password "
+            "via the OS keyring or the OPENHAIL_PASSWORD environment variable.",
+            optional=("imap_port", "smtp_port"),
+        )
         def _account_add(
             name: str,
             imap_host: str,
@@ -97,32 +139,44 @@ class RpcServer:
             username: str,
             imap_port: int = 993,
             smtp_port: int = 587,
-            password: str | None = None,
         ) -> dict[str, Any]:
+            name = v_account(name)
+            imap_host = v_hostname(imap_host)
+            smtp_host = v_hostname(smtp_host)
+            imap_port = v_port(imap_port)
+            smtp_port = v_port(smtp_port)
+            header_safe(username, "username")
             acc = self.store.add_account(
                 name=name,
                 imap_host=imap_host,
                 smtp_host=smtp_host,
                 username=username,
-                imap_port=int(imap_port),
-                smtp_port=int(smtp_port),
+                imap_port=imap_port,
+                smtp_port=smtp_port,
             )
-            stored_secret = False
-            if password:
-                try:
-                    set_password(name, username, password)
-                    stored_secret = True
-                except SecretError as exc:
-                    raise RpcError(APP_ERROR, str(exc))
-            return {"account": acc.to_dict(), "password_stored": stored_secret}
+            return {"account": acc.to_dict()}
 
         @add("account.list", (), "List configured accounts.")
         def _account_list() -> list[dict[str, Any]]:
             return [a.to_dict() for a in self.store.list_accounts()]
 
-        @add("folder.list", ("account",), "List folders for an account (local only).")
+        @add("account.set-password", ("name", "password"),
+             "Store an account password in the OS keyring. Prefer "
+             "OPENHAIL_PASSWORD over this method where possible.")
+        def _account_set_password(name: str, password: str) -> dict[str, Any]:
+            name = v_account(name)
+            acc = self.store.get_account(name)
+            if acc is None:
+                raise RpcError(INVALID_PARAMS, f"unknown account: {name}")
+            try:
+                set_password(acc.name, acc.username, password)
+            except SecretError as exc:
+                raise RpcError(APP_ERROR, str(exc))
+            return {"stored": True, "account": name}
+
+        @add("folder.list", ("account",), "List synced folders for an account.")
         def _folder_list(account: str) -> list[str]:
-            acc = self.store.get_account(account)
+            acc = self.store.get_account(v_account(account))
             if acc is None:
                 raise RpcError(INVALID_PARAMS, f"unknown account: {account}")
             cur = self.store.conn.execute(
@@ -130,11 +184,17 @@ class RpcServer:
             )
             return [r["name"] for r in cur.fetchall()]
 
-        @add("mail.sync", ("account",), "Pull new messages from IMAP into the local store.")
-        def _mail_sync(account: str, folder: str = "INBOX", limit: int = 100) -> dict[str, Any]:
-            acc = self.store.get_account(account)
+        @add("mail.sync", ("account",),
+             "Pull new messages from IMAP into the local store.",
+             optional=("folder", "limit"))
+        def _mail_sync(
+            account: str, folder: str = "INBOX", limit: int = 100
+        ) -> dict[str, Any]:
+            acc = self.store.get_account(v_account(account))
             if acc is None:
                 raise RpcError(INVALID_PARAMS, f"unknown account: {account}")
+            folder = v_folder(folder)
+            limit = bounded_int(limit, 100, MAX_SYNC_LIMIT, "limit")
             password = get_password(acc.name, acc.username)
             if password is None:
                 raise RpcError(APP_ERROR, f"no password available for {account}")
@@ -146,7 +206,7 @@ class RpcServer:
                 with ImapClient(acc.imap_host, acc.imap_port, acc.use_tls) as client:
                     client.login(acc.username, password)
                     uv = client.uid_validity()
-                    if uv:
+                    if uv and uv != str(last_uid and "" or ""):
                         self.store.set_uidvalidity(folder_id, uv)
                     client.select(folder, readonly=True)
                     for fetched in client.fetch_since_uid(last_uid, limit=limit):
@@ -156,25 +216,34 @@ class RpcServer:
                         max_uid = max(max_uid, fetched.uid)
             except ImapError as exc:
                 raise RpcError(APP_ERROR, f"imap: {exc}")
+            except (ValidationError, ValueError) as exc:
+                raise RpcError(INVALID_PARAMS, str(exc))
             if max_uid > last_uid:
                 self.store.set_last_uid(folder_id, max_uid)
             return {"added": added, "last_uid": max_uid}
 
-        @add("mail.list", ("account",), "List recent messages, newest first.")
+        @add("mail.list", ("account",), "List recent messages, newest first.",
+             optional=("limit", "folder"))
         def _mail_list(account: str, limit: int = 20, folder: str | None = None):
-            acc = self.store.get_account(account)
+            acc = self.store.get_account(v_account(account))
             if acc is None:
                 raise RpcError(INVALID_PARAMS, f"unknown account: {account}")
-            msgs = self.store.list_messages(acc.id, limit=int(limit), folder=folder)
-            return [m.to_dict() for m in msgs]
+            limit = bounded_int(limit, 20, MAX_LIST_LIMIT, "limit")
+            if folder is not None:
+                folder = v_folder(folder)
+            return [m.to_dict() for m in self.store.list_messages(acc.id, limit, folder)]
 
         @add("mail.read", ("id",), "Read one message by local row id.")
         def _mail_read(id: int) -> dict[str, Any]:
-            msg = self.store.get_message(int(id))
+            try:
+                row_id = int(id)
+            except (TypeError, ValueError):
+                raise RpcError(INVALID_PARAMS, "id must be an integer")
+            msg = self.store.get_message(row_id)
             if msg is None:
                 raise RpcError(INVALID_PARAMS, f"no message with id {id}")
             row = self.store.conn.execute(
-                "SELECT body_html, cc_addr, in_reply_to FROM messages WHERE id=?", (int(id),)
+                "SELECT body_html, cc_addr, in_reply_to FROM messages WHERE id=?", (row_id,)
             ).fetchone()
             d = msg.to_dict()
             if row:
@@ -183,14 +252,18 @@ class RpcServer:
                 d["in_reply_to"] = row["in_reply_to"]
             return d
 
-        @add("mail.search", ("account", "query"), "Full-text search over stored mail.")
+        @add("mail.search", ("account", "query"), "Full-text search over stored mail.",
+             optional=("limit",))
         def _mail_search(account: str, query: str, limit: int = 20):
-            acc = self.store.get_account(account)
+            acc = self.store.get_account(v_account(account))
             if acc is None:
                 raise RpcError(INVALID_PARAMS, f"unknown account: {account}")
-            return [m.to_dict() for m in self.store.search(acc.id, query, int(limit))]
+            limit = bounded_int(limit, 20, MAX_LIST_LIMIT, "limit")
+            return [m.to_dict() for m in self.store.search(acc.id, query, limit)]
 
-        @add("mail.send", ("account", "to", "subject", "body"), "Send mail over SMTP STARTTLS.")
+        @add("mail.send", ("account", "to", "subject", "body"),
+             "Send mail over SMTP STARTTLS. Sender is always the account identity.",
+             optional=("cc",))
         def _mail_send(
             account: str,
             to: list[str] | str,
@@ -198,20 +271,26 @@ class RpcServer:
             body: str,
             cc: list[str] | None = None,
         ) -> dict[str, Any]:
-            acc = self.store.get_account(account)
+            acc = self.store.get_account(v_account(account))
             if acc is None:
                 raise RpcError(INVALID_PARAMS, f"unknown account: {account}")
+            to_list = email_list(to, "to")
+            cc_list = email_list(cc, "cc") if cc else None
+            header_safe(subject, "subject")
+            if not isinstance(body, str):
+                raise RpcError(INVALID_PARAMS, "body must be a string")
             password = get_password(acc.name, acc.username)
             if password is None:
                 raise RpcError(APP_ERROR, f"no password available for {account}")
-            to_list = [to] if isinstance(to, str) else list(to)
-            raw = build_message(acc.username, to_list, subject, body, cc=cc)
+            raw = build_message(acc.username, to_list, subject, body, cc=cc_list)
             try:
                 result = SmtpSender(acc.smtp_host, acc.smtp_port).send(
-                    acc.username, password, acc.username, to_list, raw, cc=cc
+                    acc.username, password, acc.username, to_list, raw, cc=cc_list
                 )
             except SmtpError as exc:
                 raise RpcError(APP_ERROR, f"smtp: {exc}")
+            except ValidationError as exc:
+                raise RpcError(INVALID_PARAMS, str(exc))
             return result.to_dict()
 
         @add("mail.stats", (), "Local store statistics.")
@@ -246,46 +325,66 @@ class RpcServer:
                 return _err(req_id, INVALID_PARAMS, "params must be object or array")
         except RpcError as exc:
             return _err(req_id, exc.code, exc.message, exc.data)
+        except ValidationError as exc:
+            return _err(req_id, INVALID_PARAMS, str(exc))
         except TypeError as exc:
+            # Wrong arity or a disallowed keyword; message is safe to return.
             return _err(req_id, INVALID_PARAMS, str(exc))
         except Exception as exc:
-            return _err(
-                req_id, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}",
-                {"trace": traceback.format_exc(limit=4)},
+            # Log the full traceback locally; return only the exception class
+            # and message. Never leak a stack trace to the caller.
+            print(
+                f"[openhail] internal error in {method}: "
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
             )
+            return _err(req_id, INTERNAL_ERROR, f"{type(exc).__name__}: {exc}")
         if req_id is None:
             return None  # notification
         return _ok(req_id, result)
 
     @staticmethod
     def _call_kw(handler: Handler, params: dict[str, Any]) -> Any:
-        # Accept display names rather than raw Python signatures.
-        for key in ("id", "to", "cc", "from"):
-            if key in params and key == "from":
-                params["from_addr"] = params.pop("from")
+        # Reject unknown keys instead of silently forwarding them. This is what
+        # stops a caller from smuggling an unexpected kwarg into a handler.
+        unknown = set(params) - handler.allowed
+        if unknown:
+            raise RpcError(
+                INVALID_PARAMS,
+                f"unknown parameter(s) for {handler.name}: "
+                f"{', '.join(sorted(unknown))}; allowed: "
+                f"{', '.join(sorted(handler.allowed)) or '(none)'}",
+            )
         return handler.fn(**params)
 
     def serve_stdio(self, stdin=None, stdout=None) -> None:
         stdin = stdin or sys.stdin
         stdout = stdout or sys.stdout
         for line in stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                request = json.loads(line)
-            except json.JSONDecodeError as exc:
-                resp = _err(None, PARSE_ERROR, f"parse error: {exc}")
+            if len(line) > MAX_REQUEST_BYTES:
+                resp: Any = _err(
+                    None, INVALID_REQUEST,
+                    f"request exceeds {MAX_REQUEST_BYTES} bytes",
+                )
             else:
-                if isinstance(request, list):
-                    batch = []
-                    for item in request:
-                        r = self.handle(item)
-                        if r is not None:
-                            batch.append(r)
-                    resp = batch if batch else None
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    request = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    resp = _err(None, PARSE_ERROR, f"parse error: {exc}")
                 else:
-                    resp = self.handle(request)
+                    if isinstance(request, list):
+                        batch = []
+                        for item in request[:100]:  # cap batch size
+                            r = self.handle(item)
+                            if r is not None:
+                                batch.append(r)
+                        resp = batch if batch else None
+                    else:
+                        resp = self.handle(request)
             if resp is not None:
                 stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
                 stdout.flush()

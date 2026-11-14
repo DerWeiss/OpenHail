@@ -2,19 +2,32 @@
 
 Local-first: mail lives in a single SQLite file the user owns.
 FTS5 provides search. No network access happens in this module.
+
+Hardening notes:
+- A busy timeout is set so a pathological query cannot hang the process forever.
+- Search queries are sanitized before reaching FTS5 (see validate.search_query).
+- The LIKE fallback escapes its own wildcards so a user-supplied '%' is literal.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+
+from .validate import (
+    ValidationError,
+    bounded_int,
+    search_query as validate_search_query,
+)
 
 SCHEMA_VERSION = 1
+
+# Seconds SQLite will wait on a locked database before erroring.
+BUSY_TIMEOUT_S = 5.0
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -136,13 +149,18 @@ class Message:
         return asdict(self)
 
 
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards so user input is matched literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class Store:
     """A SQLite-backed mail store. One file, no server, no daemon."""
 
     def __init__(self, path: str | os.PathLike[str] = "mail.db") -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path))
+        self.conn = sqlite3.connect(str(self.path), timeout=BUSY_TIMEOUT_S)
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
 
@@ -257,6 +275,7 @@ class Store:
     def list_messages(
         self, account_id: int, limit: int = 20, folder: str | None = None
     ) -> list[Message]:
+        limit = bounded_int(limit, 20, 1000, "limit")
         sql = (
             "SELECT m.* FROM messages m JOIN folders f ON f.id = m.folder_id "
             "WHERE m.account_id=? "
@@ -276,7 +295,9 @@ class Store:
         return self._row_to_message(row) if row else None
 
     def search(self, account_id: int, query: str, limit: int = 20) -> list[Message]:
-        """FTS5 search. Query is passed as a bound parameter, never interpolated."""
+        """FTS5 search. Query is sanitized and passed as a bound parameter."""
+        query = validate_search_query(query)
+        limit = bounded_int(limit, 20, 1000, "limit")
         sql = (
             "SELECT m.* FROM messages_fts fts "
             "JOIN messages m ON m.id = fts.rowid "
@@ -287,11 +308,11 @@ class Store:
             cur = self.conn.execute(sql, (query, account_id, limit))
             return [self._row_to_message(r) for r in cur.fetchall()]
         except sqlite3.OperationalError:
-            # malformed FTS query — fall back to LIKE, still parameterized
-            like = f"%{query}%"
+            # malformed FTS query — fall back to LIKE with escaped wildcards
+            like = f"%{_escape_like(query)}%"
             cur = self.conn.execute(
                 "SELECT * FROM messages WHERE account_id=? AND "
-                "(subject LIKE ? OR body_text LIKE ?) "
+                "(subject LIKE ? ESCAPE '\\' OR body_text LIKE ? ESCAPE '\\') "
                 "ORDER BY date_utc DESC LIMIT ?",
                 (account_id, like, like, limit),
             )

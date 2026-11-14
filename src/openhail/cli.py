@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -72,8 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
     a_add.add_argument("--imap", required=True, help="host[:port]")
     a_add.add_argument("--smtp", required=True, help="host[:port]")
     a_add.add_argument("--user", required=True)
-    a_add.add_argument("--password", help="omit to read OPENHAIL_PASSWORD")
     a_sub.add_parser("list")
+    a_setpw = a_sub.add_parser(
+        "set-password",
+        help="store a password in the OS keyring (never passed on the command line)",
+    )
+    a_setpw.add_argument("--name", required=True)
 
     s = sub.add_parser("sync", help="pull mail from IMAP")
     s.add_argument("--account", required=True)
@@ -127,14 +132,22 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "list":
             _print(_call(db, "account.list"), args.json)
             return 0
+        if args.action == "set-password":
+            pw = os.environ.get("OPENHAIL_PASSWORD") or getpass.getpass(
+                "password (not echoed): "
+            )
+            if not pw:
+                print("error: empty password", file=sys.stderr)
+                return 1
+            _print(_call(db, "account.set-password", name=args.name, password=pw), args.json)
+            return 0
         imap_host, imap_port = _split_hostport(args.imap, 993)
         smtp_host, smtp_port = _split_hostport(args.smtp, 587)
-        password = args.password or os.environ.get("OPENHAIL_PASSWORD")
         out = _call(
             db, "account.add",
             name=args.name, imap_host=imap_host, imap_port=imap_port,
             smtp_host=smtp_host, smtp_port=smtp_port,
-            username=args.user, password=password,
+            username=args.user,
         )
         _print(out, args.json)
         return 0
