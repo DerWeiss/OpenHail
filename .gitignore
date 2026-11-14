@@ -1,0 +1,11 @@
+pytest_cache/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+.venv/
+analysis/*.json
+analysis/*.dll
+analysis/*.exe
+
