@@ -18,6 +18,9 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Communications :: Email :: Email Clients (MUA)",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: MacOS X",
+    "Environment :: X11 Applications",
 ]
 dependencies = []
 
@@ -26,6 +29,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 openhail = "openhail.cli:main"
+openhail-gui = "openhail.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

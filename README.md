@@ -96,6 +96,21 @@ openhail send --account fastmail --to someone@example.com \
 openhail search --account fastmail --query "invoice"
 ```
 
+Or use the desktop GUI (stdlib Tk, no extra dependencies):
+
+```
+openhail-gui
+# or point it at a specific database:
+openhail-gui --db C:\path\to\mail.db
+```
+
+The GUI is a thin client: it does not open the database and does not read the
+keyring. It spawns `openhail serve` as a child process and speaks JSON-RPC over
+that child's stdin/stdout — the same stdio-only transport as the CLI. Every
+string that comes back from the server is passed through
+`validate.strip_control()` before it reaches a widget, so a crafted subject line
+cannot drive the UI with escape sequences.
+
 JSON-RPC mode — one JSON object per line over stdio:
 
 ```
@@ -109,7 +124,7 @@ pip install pytest
 python -m pytest tests -q
 ```
 
-17 tests, no network required.
+86 tests, no network required.
 
 ## Architecture
 
