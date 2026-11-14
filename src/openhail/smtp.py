@@ -93,6 +93,68 @@ class SmtpSender:
                     refused=refused,
                     response="sent",
                 )
+        except SmtpError:
+            raise
+        except ValidationError:
+            raise
+        except smtplib.SMTPAuthenticationError as exc:
+            raise SmtpError(f"SMTP AUTH rejected for {username}: {exc}") from exc
+        except smtplib.SMTPException as exc:
+            raise SmtpError(f"SMTP failure: {exc}") from exc
+        except OSError as exc:
+            raise SmtpError(f"Connection to {self.host}:{self.port} failed: {exc}") from exc
+
+    def send_xoauth2(
+        self,
+        username: str,
+        access_token: str,
+        to_addrs: list[str],
+        raw_message: bytes,
+        cc: list[str] | None = None,
+    ) -> SendResult:
+        """Send via SASL XOAUTH2 — the only path Gmail and Microsoft 365 allow."""
+        if len(raw_message) > MAX_SEND_BYTES:
+            raise SmtpError(
+                f"message is {len(raw_message)} bytes, exceeds the "
+                f"{MAX_SEND_BYTES} byte limit"
+            )
+        if not access_token:
+            raise SmtpError("empty access token")
+        ctx = ssl.create_default_context()
+        recipients = list(to_addrs) + list(cc or [])
+        if not recipients:
+            raise SmtpError("No recipients.")
+        if len(recipients) > 100:
+            raise SmtpError("Too many recipients (max 100).")
+        auth_string = f"user={username}\x01auth=Bearer {access_token}\x01\x01"
+        sender = username
+        try:
+            with smtplib.SMTP(self.host, self.port, timeout=self.timeout) as smtp:
+                smtp.ehlo()
+                if not smtp.has_extn("starttls"):
+                    raise SmtpError(
+                        f"{self.host}:{self.port} does not advertise STARTTLS; "
+                        "refusing to send a bearer token over plaintext."
+                    )
+                smtp.starttls(context=ctx)
+                smtp.ehlo()
+                code, resp = smtp.docmd("AUTH", "XOAUTH2 " + auth_string)
+                if code != 235:
+                    raise SmtpError(
+                        f"XOAUTH2 rejected for {username}: {code} "
+                        f"{resp.decode(errors='replace') if isinstance(resp, bytes) else resp}"
+                    )
+                refused: dict[str, tuple[int, bytes]] = {}
+                result = smtp.sendmail(sender, recipients, raw_message)
+                if result:
+                    refused = dict(result)
+                return SendResult(
+                    accepted=[r for r in recipients if r not in refused],
+                    refused=refused,
+                    response="sent",
+                )
+        except SmtpError:
+            raise
         except ValidationError:
             raise
         except smtplib.SMTPAuthenticationError as exc:

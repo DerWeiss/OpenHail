@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     smtp_port INTEGER NOT NULL DEFAULT 587,
     username TEXT NOT NULL,
     use_tls  INTEGER NOT NULL DEFAULT 1,
+    auth_kind TEXT NOT NULL DEFAULT 'plain',
+    auth_provider TEXT,
     created  TEXT NOT NULL
 );
 
@@ -123,6 +125,8 @@ class Account:
     smtp_port: int
     username: str
     use_tls: bool
+    auth_kind: str = "plain"
+    auth_provider: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -218,6 +222,8 @@ class Store:
             smtp_port=row["smtp_port"],
             username=row["username"],
             use_tls=bool(row["use_tls"]),
+            auth_kind=(row["auth_kind"] if "auth_kind" in row.keys() else "plain") or "plain",
+            auth_provider=(row["auth_provider"] if "auth_provider" in row.keys() else None),
         )
 
     # ---- folders --------------------------------------------------------
@@ -249,6 +255,26 @@ class Store:
     def set_last_uid(self, folder_id: int, uid: int) -> None:
         self.conn.execute("UPDATE folders SET last_uid=? WHERE id=?", (uid, folder_id))
         self.conn.commit()
+
+    def set_account_auth(self, account_id: int, auth_kind: str,
+                         provider: str | None = None) -> None:
+        """Mark an account as password-authenticated or OAuth2 (XOAUTH2)."""
+        if auth_kind not in ("plain", "xoauth2"):
+            raise ValueError(f"unsupported auth_kind: {auth_kind!r}")
+        self.conn.execute(
+            "UPDATE accounts SET auth_kind=?, auth_provider=? WHERE id=?",
+            (auth_kind, provider, account_id),
+        )
+        self.conn.commit()
+
+    def get_account_auth(self, account_id: int) -> tuple[str, str | None]:
+        cur = self.conn.execute(
+            "SELECT auth_kind, auth_provider FROM accounts WHERE id=?", (account_id,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            return ("plain", None)
+        return (row["auth_kind"] or "plain", row["auth_provider"])
 
     # ---- messages -------------------------------------------------------
 

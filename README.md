@@ -23,8 +23,17 @@ and tested. No GUI yet.
 | JSON-RPC control surface | working |
 | CLI | working |
 | GUI | not started |
-| OAuth2 / XOAUTH2 | not started |
+| OAuth2 / XOAUTH2 (Gmail, Microsoft 365) | working |
 | JMAP / Graph-native | not started |
+
+Two things worth knowing before you file an issue:
+
+- **The transport is stdio-only, permanently.** There is no listening socket and
+  no plan to add one. A GUI is a *client* speaking the same JSON-RPC protocol,
+  never the process holding the credentials. This removes an entire class of
+  network auth bugs before they can be written.
+- **Every caller-supplied value is validated** in `src/openhail/validate.py`, and
+  each limit has a test naming the attack it blocks. See `tests/test_hardening.py`.
 
 ## Why not just use IMAP everywhere?
 
@@ -35,6 +44,18 @@ passwords, Dovecot, self-hosted), then XOAUTH2, then provider-native APIs.
 The `analysis/` directory contains reverse-engineering notes about how the *new Outlook*
 client is built, used **only** to understand which protocols an interoperable client must
 speak. See `analysis/REA-FINDINGS.md`. No Microsoft code is copied or redistributed.
+
+## Gmail and Microsoft 365
+
+Both providers killed plain-password IMAP/SMTP. OpenHail speaks **XOAUTH2**, so it
+works against both — including on a headless box, via the device-code flow.
+Full setup, scope rationale, and threat model: [`docs/OAUTH.md`](docs/OAUTH.md).
+
+```
+openhail account add-oauth --name gmail --provider google --user you@gmail.com
+openhail oauth login --account gmail --provider google --client-id YOUR_CLIENT_ID
+openhail sync --account gmail
+```
 
 ## Design principles
 

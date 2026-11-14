@@ -14,15 +14,34 @@ Ordered by what actually blocks real use, not by what's fun to build.
 
 Covers: Fastmail, Dovecot, self-hosted, Proton Bridge, Gmail with an app password.
 
-## M2 — OAuth2 / XOAUTH2 (the real gate)
+## M2 — OAuth2 / XOAUTH2 (the real gate) ✅
 
-Gmail and Microsoft 365 have both killed basic auth. Without this, OpenHail cannot talk to
-the two largest mail providers on earth. Everything else is decoration next to this.
+Gmail and Microsoft 365 have both killed basic auth. Without this, OpenHail could not talk
+to the two largest mail providers on earth. Everything else was decoration next to it.
 
 - Google OAuth device flow + `XOAUTH2` SASL for IMAP and SMTP
 - Microsoft identity platform device code flow
-- Token refresh, encrypted at rest in the keyring alongside the refresh token
-- Per-account scopes, request only `mail.readwrite`+`mail.send`
+- Authorization-code + PKCE flow for clients with a redirect URI
+- Token refresh with rotation, persisted to the keyring alongside the refresh token
+- Per-account auth kind (`plain` | `xoauth2`), chosen automatically at sync/send time
+- 33 OAuth tests passing, all offline. See `docs/OAUTH.md`.
+
+Not covered: Google Workspace domain-wide delegation (needs RS256 service-account
+JWT signing).
+
+## M2.5 — hardening ✅
+
+Done before M3, because the repo is public and red-teamers read faster than
+maintainers write.
+
+- Every caller-supplied value validated in one module (`validate.py`)
+- Envelope sender pinned to the authenticated identity
+- CRLF rejected in all headers (injection)
+- Request / MIME part / send size caps (DoS)
+- Unknown RPC params rejected (smuggling)
+- Tracebacks logged to stderr, never returned
+- No credential accepted via argv
+- 36 hardening + core tests
 
 ## M3 — attachments
 

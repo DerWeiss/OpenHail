@@ -79,6 +79,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="store a password in the OS keyring (never passed on the command line)",
     )
     a_setpw.add_argument("--name", required=True)
+    a_oauth = a_sub.add_parser(
+        "add-oauth",
+        help="add an account that signs in with OAuth2 (Gmail / Microsoft 365)",
+    )
+    a_oauth.add_argument("--name", required=True)
+    a_oauth.add_argument("--provider", required=True, choices=["google", "microsoft"])
+    a_oauth.add_argument("--user", required=True, help="the email address")
 
     s = sub.add_parser("sync", help="pull mail from IMAP")
     s.add_argument("--account", required=True)
@@ -107,6 +114,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("stats", help="local store statistics")
 
+    oa = sub.add_parser("oauth", help="OAuth2 / XOAUTH2 sign-in (Gmail, Microsoft 365)")
+    oa_sub = oa.add_subparsers(dest="action", required=True)
+    oa_sub.add_parser("providers", help="list supported providers")
+    oa_login = oa_sub.add_parser(
+        "login", help="device-code sign-in; prints a URL and code to visit"
+    )
+    oa_login.add_argument("--account", required=True)
+    oa_login.add_argument("--provider", required=True, choices=["google", "microsoft"])
+    oa_login.add_argument("--client-id", required=True)
+    oa_status = oa_sub.add_parser("status", help="is a token stored for this account?")
+    oa_status.add_argument("--account", required=True)
+    oa_refresh = oa_sub.add_parser("refresh", help="force a token refresh now")
+    oa_refresh.add_argument("--account", required=True)
+    oa_refresh.add_argument("--provider", required=True, choices=["google", "microsoft"])
+    oa_refresh.add_argument("--client-id", required=True)
+
     sv = sub.add_parser("serve", help="run the JSON-RPC server on stdio")
     sv.add_argument("--stdio", action="store_true", default=True)
 
@@ -127,6 +150,38 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "serve":
         RpcServer(db).serve_stdio()
         return 0
+
+    if args.cmd == "oauth":
+        if args.action == "providers":
+            _print(_call(db, "oauth.providers"), args.json)
+            return 0
+        if args.action == "status":
+            _print(_call(db, "oauth.status", account=args.account), args.json)
+            return 0
+        if args.action == "login":
+            start = _call(
+                db, "oauth.device-start",
+                account=args.account, provider=args.provider, client_id=args.client_id,
+            )
+            print()
+            print(f"  1. open:  {start['verification_uri']}")
+            print(f"  2. enter: {start['user_code']}")
+            print()
+            print("  waiting for you to finish in the browser...")
+            done = _call(
+                db, "oauth.device-poll",
+                account=args.account, provider=args.provider,
+                client_id=args.client_id, device_code=start["device_code"],
+                interval=start["interval"], expires_at=start["expires_at"],
+            )
+            _print(done, args.json)
+            return 0
+        if args.action == "refresh":
+            _print(_call(
+                db, "oauth.refresh",
+                account=args.account, provider=args.provider, client_id=args.client_id,
+            ), args.json)
+            return 0
 
     if args.cmd == "account":
         if args.action == "list":

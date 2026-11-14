@@ -76,6 +76,23 @@ class ImapClient:
         if typ != "OK":
             raise ImapError(f"LOGIN returned {typ!r}: {data!r}")
 
+    def authenticate_xoauth2(self, username: str, access_token: str) -> None:
+        """SASL XOAUTH2 auth — required by Gmail and Microsoft 365.
+
+        Neither provider accepts LOGIN with a password any more, so this is the
+        only path that works against them.
+        """
+        if self._conn is None:
+            self.connect()
+        assert self._conn is not None
+        payload = f"user={username}\x01auth=Bearer {access_token}\x01\x01".encode()
+        try:
+            typ, data = self._conn.authenticate("XOAUTH2", lambda _c: payload)
+        except imaplib.IMAP4.error as exc:
+            raise ImapError(f"XOAUTH2 rejected for {username}: {exc}") from exc
+        if typ != "OK":
+            raise ImapError(f"XOAUTH2 returned {typ!r}: {data!r}")
+
     def logout(self) -> None:
         if self._conn is None:
             return
