@@ -139,3 +139,35 @@ def header_safe(value: object, field: str = "value") -> str:
             f"{field} must not contain CR/LF (header injection)"
         )
     return value
+
+
+_ESCAPE_RE = re.compile(
+    r"""
+    \x1b  \[ [0-9;?]* [A-Za-z]          # CSI  - colours, cursor moves, clears
+  | \x1b  \]  [^\x07\x1b]* (\x07|\x1b\\)  # OSC  - window title, clipboard (OSC 52)
+  | \x1b  [PX^_] [^\x1b]* \x1b\\        # DCS/SOS/PM/APC string sequences
+  | \x1b  [@-Z\\-_]                     # Fe   - single-char escapes
+  | \x9b  [0-9;?]* [A-Za-z]             # 8-bit CSI (C1)
+    """,
+    re.VERBOSE,
+)
+
+
+def strip_control(text: object) -> str:
+    """Remove terminal escape sequences from untrusted text before printing.
+
+    Mail subjects and bodies are attacker-controlled. Printed raw to a
+    terminal they can rewrite the window title, clear the screen, move the
+    cursor to spoof a prompt, or - via OSC 52 - write to the clipboard.
+    This is the terminal equivalent of XSS.
+
+    Only affects display. Stored and transmitted bytes are untouched.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    text = _ESCAPE_RE.sub("", text)
+    # Remaining C0 controls (except tab) and DEL have no business in output.
+    return "".join(
+        ch for ch in text
+        if ch == "\t" or (ch >= " " and ch != "\x7f")
+    )

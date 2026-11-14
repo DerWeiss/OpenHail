@@ -12,6 +12,7 @@ from typing import Any
 
 from . import __version__
 from .server import RpcServer
+from .validate import strip_control
 
 
 def _default_db() -> str:
@@ -45,15 +46,18 @@ def _print(obj: Any, as_json: bool) -> None:
     if isinstance(obj, list):
         for item in obj:
             if isinstance(item, dict):
-                print(" | ".join(f"{k}={v}" for k, v in item.items() if v not in (None, "")))
+                print(" | ".join(
+                    f"{k}={strip_control(v)}"
+                    for k, v in item.items() if v not in (None, "")
+                ))
             else:
-                print(item)
+                print(strip_control(item))
         return
     if isinstance(obj, dict):
         for k, v in obj.items():
-            print(f"{k}: {v}")
+            print(f"{k}: {strip_control(v)}")
         return
-    print(obj)
+    print(strip_control(obj))
 
 
 def build_parser() -> argparse.ArgumentParser:
