@@ -10,6 +10,7 @@ Hardening notes:
 
 from __future__ import annotations
 
+import base64
 import smtplib
 import ssl
 from dataclasses import dataclass
@@ -126,7 +127,13 @@ class SmtpSender:
             raise SmtpError("No recipients.")
         if len(recipients) > 100:
             raise SmtpError("Too many recipients (max 100).")
+        # SASL XOAUTH2 requires the initial response to be base64-encoded.
+        # `docmd` writes its argument to the socket verbatim (unlike
+        # `imaplib.authenticate`, which encodes the callback result for you),
+        # so the encoding has to happen here. Sending it raw leaks the bearer
+        # token into the SMTP dialogue and puts \x01 bytes inside a command.
         auth_string = f"user={username}\x01auth=Bearer {access_token}\x01\x01"
+        auth_b64 = base64.b64encode(auth_string.encode("utf-8")).decode("ascii")
         sender = username
         try:
             with smtplib.SMTP(self.host, self.port, timeout=self.timeout) as smtp:
@@ -138,7 +145,7 @@ class SmtpSender:
                     )
                 smtp.starttls(context=ctx)
                 smtp.ehlo()
-                code, resp = smtp.docmd("AUTH", "XOAUTH2 " + auth_string)
+                code, resp = smtp.docmd("AUTH", "XOAUTH2 " + auth_b64)
                 if code != 235:
                     raise SmtpError(
                         f"XOAUTH2 rejected for {username}: {code} "
