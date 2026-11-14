@@ -123,7 +123,11 @@ class ImapClient:
 
     def select(self, folder: str = "INBOX", readonly: bool = True) -> int:
         conn = self._require()
-        typ, data = conn.select(f'"{folder}"', readonly=readonly)
+        # Folder names must be escaped or a name containing a quote can break
+        # out of the quoted string and inject IMAP commands. Names also arrive
+        # from the server via list_folders(), so they cannot be trusted.
+        quoted = '"' + folder.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        typ, data = conn.select(quoted, readonly=readonly)
         if typ != "OK":
             raise ImapError(f"SELECT {folder} failed: {data!r}")
         try:
